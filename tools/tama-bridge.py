@@ -52,51 +52,85 @@ def send(binary: str, payload: dict, dry: bool) -> None:
         print(f"tama-bridge: tamaclaude binary not found at {binary}", file=sys.stderr)
 
 
-def event_from_line(o: dict) -> dict | None:
-    """Translate one transcript line into a HookEvent dict, or None to skip."""
-    if o.get("isSidechain"):  # subagent/sidechain lines — skip in v1
-        return None
+SUBAGENT_TOOLS = ("Task", "Agent")
+
+
+def events_from_line(o: dict, pending: dict) -> list[dict]:
+    """Translate one transcript line into zero or more HookEvent dicts.
+
+    `pending` maps session_id -> set of tool_use ids for subagent (Task/Agent)
+    calls we've opened but not yet seen a tool_result for. Tracking ids lets us
+    emit a balanced SubagentStart/SubagentStop pair so the daemon raises its
+    subagent counter and shows the `conducting` pose while a subagent runs
+    (and handles several concurrent subagents correctly).
+    """
+    # subagent-internal (sidechain) lines never drive the parent's pose; start
+    # and stop are detected from the PARENT's Task tool_use and its tool_result,
+    # both of which are non-sidechain.
+    if o.get("isSidechain"):
+        return []
     sid = o.get("sessionId")
     if not sid:
-        return None
+        return []
     base = {"session_id": sid, "cwd": o.get("cwd")}
     msg = o.get("message") or {}
     content = msg.get("content")
     kind = o.get("type")
+    out: list[dict] = []
 
     if kind == "assistant":
-        tools = []
-        if isinstance(content, list):
-            tools = [
-                b.get("name")
-                for b in content
-                if isinstance(b, dict) and b.get("type") == "tool_use"
-            ]
-        if tools:
-            # last tool_use in the message is the freshest activity
-            return {**base, "hook_event_name": "PreToolUse", "tool_name": tools[-1]}
-        if msg.get("stop_reason") == "end_turn":
-            return {**base, "hook_event_name": "Stop"}
-        return None
+        tool_uses = (
+            [b for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
+            if isinstance(content, list)
+            else []
+        )
+        # a Task/Agent tool_use spawns a subagent -> SubagentStart
+        opened = pending.setdefault(sid, set())
+        for b in tool_uses:
+            if b.get("name") in SUBAGENT_TOOLS:
+                tid = b.get("id")
+                if tid and tid not in opened:
+                    opened.add(tid)
+                    out.append({**base, "hook_event_name": "SubagentStart"})
+        # pose comes from the freshest *non-subagent* tool; while a subagent is
+        # open the daemon overrides whatever this is with `conducting` anyway
+        plain = [b for b in tool_uses if b.get("name") not in SUBAGENT_TOOLS]
+        if plain:
+            out.append(
+                {**base, "hook_event_name": "PreToolUse", "tool_name": plain[-1].get("name")}
+            )
+        elif not tool_uses and msg.get("stop_reason") == "end_turn":
+            out.append({**base, "hook_event_name": "Stop"})
+        return out
 
     if kind == "user":
-        # a `user` line carrying a tool_result is a tool completion, not a prompt
-        if isinstance(content, list) and any(
-            isinstance(b, dict) and b.get("type") == "tool_result" for b in content
-        ):
-            return None
+        blocks = content if isinstance(content, list) else []
+        # a tool_result closing a Task/Agent call -> SubagentStop
+        opened = pending.get(sid)
+        had_tool_result = False
+        for b in blocks:
+            if isinstance(b, dict) and b.get("type") == "tool_result":
+                had_tool_result = True
+                tid = b.get("tool_use_id")
+                if opened and tid in opened:
+                    opened.discard(tid)
+                    out.append({**base, "hook_event_name": "SubagentStop"})
+        if had_tool_result:
+            return out  # a tool completion, not a user prompt
+
         text = ""
         if isinstance(content, str):
             text = content
         elif isinstance(content, list):
             text = " ".join(
                 b.get("text", "")
-                for b in content
+                for b in blocks
                 if isinstance(b, dict) and b.get("type") == "text"
             )
-        return {**base, "hook_event_name": "UserPromptSubmit", "prompt": text[:80]}
+        out.append({**base, "hook_event_name": "UserPromptSubmit", "prompt": text[:80]})
+        return out
 
-    return None
+    return out
 
 
 def main() -> None:
@@ -119,6 +153,7 @@ def main() -> None:
     args = ap.parse_args()
 
     offsets: dict[str, int] = {}  # path -> byte offset already consumed
+    pending: dict[str, set] = {}  # session_id -> open subagent tool_use ids
 
     while True:
         paths = glob.glob(os.path.join(PROJECTS, "*", "*.jsonl"))
@@ -149,8 +184,7 @@ def main() -> None:
                             o = json.loads(line)
                         except json.JSONDecodeError:
                             continue
-                        ev = event_from_line(o)
-                        if ev:
+                        for ev in events_from_line(o, pending):
                             send(args.binary, ev, args.dry_run)
                     offsets[p] = fh.tell()
             except FileNotFoundError:
