@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Autostart the hook-free TamaClaude bridge as a user LaunchAgent.
+  Install (no sudo — user domain):
+    cp ~/Code/lab/tamaclawdi/tools/com.nat.tama-bridge.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.nat.tama-bridge.plist
+  Stop / uninstall:
+    launchctl bootout gui/$(id -u)/com.nat.tama-bridge
+    rm ~/Library/LaunchAgents/com.nat.tama-bridge.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nat.tama-bridge</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/n.luenthaisong/Code/lab/tamaclawdi/tools/tama-bridge.py</string>
+        <string>--poll</string>
+        <string>1</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/n.luenthaisong/.tamaclaude/bridge.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/n.luenthaisong/.tamaclaude/bridge.err</string>
+</dict>
+</plist>
